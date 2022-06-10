@@ -38,11 +38,12 @@ func TestMain(m *testing.M) {
 	}
 
 	SetPrefix("app")
-	m.Run()
+	exit := m.Run()
 
 	for key := range values {
 		os.Unsetenv(key)
 	}
+	os.Exit(exit)
 }
 
 func TestString(t *testing.T) {
