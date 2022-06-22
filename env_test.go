@@ -23,6 +23,10 @@ var values = map[string]string{
 
 	"APP_LIST": "test1 test2",
 
+	"APP_BOOL_TRUE":   "True",
+	"APP_BOOL_YES":    "yEs",
+	"APP_BOOL_TRUEUP": "TRUE",
+
 	"APP_TEST1_REDIRECT":  "https://example.org",
 	"APP_TEST1_RATELIMIT": "1r/s",
 	"APP_TEST1_ROOM":      "!test1@example.com",
@@ -101,6 +105,9 @@ func TestBool(t *testing.T) {
 		{"exists", "enabled", true},
 		{"notexists", "none", false},
 		{"invalid", "ban.size", false},
+		{"true", "bool.true", true},
+		{"trueup", "bool.trueup", true},
+		{"yes", "bool.yes", true},
 	}
 
 	for _, test := range tests {
