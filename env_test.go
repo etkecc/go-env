@@ -64,7 +64,12 @@ func TestString(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			actual := String(test.shortkey, test.defaultValue)
+			var actual string
+			if test.defaultValue == "" {
+				actual = String(test.shortkey)
+			} else {
+				actual = String(test.shortkey, test.defaultValue)
+			}
 
 			if test.expected != actual {
 				t.Error(test.expected, "is not", actual)
