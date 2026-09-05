@@ -1,7 +1,6 @@
 package dotenv
 
-// This file is modified version of github.com/joho/godotenv/parser.go
-// The original file is licensed under MIT License
+// This file is a modified version of github.com/joho/godotenv/parser.go, originally licensed under MIT.
 import (
 	"bytes"
 	"errors"
@@ -46,9 +45,7 @@ func parseBytes(src []byte, out map[string]string) error {
 	return nil
 }
 
-// getStatementPosition returns position of statement begin.
-//
-// It skips any comment line or non-whitespace character.
+// getStatementStart returns the position of the next statement, skipping comment lines and non-whitespace.
 func getStatementStart(src []byte) []byte {
 	pos := indexOfNonSpaceChar(src)
 	if pos == -1 {
@@ -104,7 +101,8 @@ loop:
 
 			return "", nil, fmt.Errorf(
 				`unexpected character %q in variable name near %q`,
-				string(char), string(src))
+				string(char), string(src),
+			)
 		}
 	}
 
@@ -143,8 +141,7 @@ func extractVarValue(src []byte, vars map[string]string) (value string, rest []b
 			return "", src[endOfLine:], nil
 		}
 
-		// Work backwards to check if the line ends in whitespace then
-		// a comment (ie asdasd # some comment)
+		// work backwards to check if the line ends in whitespace then a comment (e.g. asdasd # some comment)
 		for i := endOfVar - 1; i >= 0; i-- {
 			if line[i] == charComment && i > 0 {
 				if isSpace(line[i-1]) {
@@ -174,8 +171,7 @@ func extractVarValue(src []byte, vars map[string]string) (value string, rest []b
 		trimFunc := isCharFunc(rune(quote))
 		value = string(bytes.TrimLeftFunc(bytes.TrimRightFunc(src[0:i], trimFunc), trimFunc))
 		if quote == prefixDoubleQuote {
-			// unescape newlines for double quote (this is compat feature)
-			// and expand environment variables
+			// unescape newlines for double quote (compat feature) and expand environment variables
 			value = expandVariables(expandEscapes(value), vars)
 		}
 
@@ -232,9 +228,7 @@ func isCharFunc(char rune) func(rune) bool {
 	}
 }
 
-// isSpace reports whether the rune is a space character but not line break character
-//
-// this differs from unicode.IsSpace, which also applies line break as space
+// isSpace reports whether the rune is a space character, excluding line breaks (unlike unicode.IsSpace).
 func isSpace(r rune) bool {
 	switch r {
 	case '\t', '\v', '\f', '\r', ' ', 0x85, 0xA0:
