@@ -6,280 +6,161 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
-const DefaultFile = ".env"
-
-var (
-	escapePattern   = regexp.MustCompile(`\\.`)
-	unescapePattern = regexp.MustCompile(`\\([^$])`)
-	varPattern      = regexp.MustCompile(`(\\)?(\$)(\()?\{?([A-Z0-9_]+)?\}?`)
+const (
+	// DefaultFile is the file Load always reads first.
+	DefaultFile = ".env"
+	// bom is stripped from the start of a file when present.
+	bom = "\ufeff"
 )
 
-// Load reads .env files and sets env vars; errors silently discarded.
-func Load(additionalFiles ...string) {
-	files := make([]string, 0, 1+len(additionalFiles))
-	files = append(files, DefaultFile)
-	files = append(files, additionalFiles...)
+// Load reads DefaultFile then additionalFiles in order, later files winning.
+func Load(additionalFiles ...string) error {
+	files := append([]string{DefaultFile}, additionalFiles...)
+	errs := make([]error, 0, len(files))
 
-	for _, f := range files {
-		loadFile(f) //nolint:errcheck // intentional silent discard
+	for _, file := range files {
+		if err := loadFile(file); err != nil {
+			errs = append(errs, err)
+		}
 	}
+
+	return errors.Join(errs...)
 }
 
+// loadFile applies every statement it can parse from one file, reporting the rest.
 func loadFile(filename string) error {
 	fi, err := os.Stat(filename)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return err
+
+		return fmt.Errorf("%s: %w", filename, err)
 	}
+
 	if fi.IsDir() {
 		return nil
 	}
 
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: %w", filename, err)
 	}
 
 	vars := make(map[string]string)
-	if err := parseContent(data, vars); err != nil {
+	parseErr := parseContent(data, vars)
+	errs := make([]error, 0, len(vars)+1)
+	if parseErr != nil {
+		errs = append(errs, parseErr)
+	}
+
+	for key, value := range vars {
+		if err := os.Setenv(key, value); err != nil {
+			errs = append(errs, fmt.Errorf("cannot set %s: %w", key, err))
+		}
+	}
+
+	if len(errs) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf("%s: %w", filename, errors.Join(errs...))
+}
+
+// parseContent fills out from src, reporting failed lines without dropping the rest.
+func parseContent(src []byte, out map[string]string) error {
+	lines := splitLines(bytes.TrimPrefix(src, []byte(bom)))
+	errs := make([]error, 0, 1)
+
+	for i, line := range lines {
+		if err := parseLine(line, out); err != nil {
+			errs = append(errs, fmt.Errorf("line %d: %w", i+1, err))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// splitLines breaks src at LF, CRLF and lone CR.
+func splitLines(src []byte) [][]byte {
+	src = bytes.ReplaceAll(src, []byte("\r\n"), []byte("\n"))
+	src = bytes.ReplaceAll(src, []byte("\r"), []byte("\n"))
+
+	return bytes.Split(src, []byte("\n"))
+}
+
+// parseLine parses one statement, ignoring blank and comment lines.
+func parseLine(line []byte, out map[string]string) error {
+	line = bytes.TrimLeftFunc(line, unicode.IsSpace)
+	if len(line) == 0 || line[0] == '#' {
+		return nil
+	}
+
+	key, rest, err := extractKey(line)
+	if err != nil {
 		return err
 	}
 
-	for k, v := range vars {
-		os.Setenv(k, v)
+	value, err := extractValue(rest, out)
+	if err != nil {
+		return err
 	}
+
+	if strings.IndexByte(value, 0) >= 0 {
+		return fmt.Errorf("value of %s contains a NUL byte", key)
+	}
+
+	out[key] = value
 
 	return nil
 }
 
-func parseContent(src []byte, out map[string]string) error {
-	src = bytes.ReplaceAll(src, []byte("\r\n"), []byte("\n"))
+// extractKey splits a statement into its name and the value that follows.
+func extractKey(line []byte) (key string, rest []byte, err error) {
+	line = stripExport(bytes.TrimLeftFunc(line, unicode.IsSpace))
 
-	for {
-		src = skipToStatement(src)
-		if src == nil {
-			return nil
-		}
-
-		key, remaining, err := extractKey(src)
-		if err != nil {
-			return err
-		}
-
-		value, rest, err := extractValue(remaining, out)
-		if err != nil {
-			return err
-		}
-
-		out[key] = value
-		src = rest
-	}
-}
-
-func skipToStatement(src []byte) []byte {
-	i := bytes.IndexFunc(src, func(r rune) bool { return !unicode.IsSpace(r) })
-	if i < 0 {
-		return nil
-	}
-	src = src[i:]
-
-	if len(src) > 0 && src[0] == '#' {
-		j := bytes.IndexByte(src, '\n')
-		if j < 0 {
-			return nil
-		}
-		return skipToStatement(src[j+1:])
-	}
-
-	return src
-}
-
-func extractKey(src []byte) (key string, remaining []byte, err error) {
-	src = bytes.TrimLeftFunc(src, isSpace)
-
-	if bytes.HasPrefix(src, []byte("export")) && len(src) > 6 && isSpace(rune(src[6])) {
-		src = src[6:]
-		src = bytes.TrimLeftFunc(src, isSpace)
-	}
-
-	sep := -1
-	for i, b := range src {
-		if b == '=' || b == ':' {
-			sep = i
-			break
-		}
-		switch {
-		case isSpace(rune(b)):
-			continue
-		case b == '_':
-			continue
-		case unicode.IsLetter(rune(b)) || unicode.IsNumber(rune(b)) || b == '.':
-			continue
-		default:
-			return "", nil, fmt.Errorf("unexpected character %q in variable name near %q", b, string(src))
-		}
-	}
-
-	if sep < 0 {
-		if len(src) == 0 {
-			return "", nil, errors.New("zero length string")
-		}
-		key = strings.TrimRightFunc(string(src), unicode.IsSpace)
-		return key, nil, nil
-	}
-
-	key = string(src[:sep])
-	remaining = src[sep+1:]
-	key = strings.TrimRightFunc(key, unicode.IsSpace)
-	remaining = bytes.TrimLeftFunc(remaining, isSpace)
-
-	return
-}
-
-func extractValue(src []byte, vars map[string]string) (value string, rest []byte, err error) {
-	if len(src) == 0 {
-		return "", nil, nil
-	}
-
-	prefix, isQuoted := hasQuotePrefix(src)
-	if !isQuoted {
-		return extractUnquoted(src, vars)
-	}
-
-	if prefix == '\'' {
-		return extractSingleQuoted(src)
-	}
-
-	return extractDoubleQuoted(src, vars)
-}
-
-func extractUnquoted(src []byte, vars map[string]string) (value string, rest []byte, err error) {
-	i := bytes.IndexFunc(src, isLineEnd)
-	var line []byte
-	if i < 0 {
-		line = src
-		rest = nil
-	} else {
-		line = src[:i]
-		rest = src[i:]
-	}
-
-	if len(line) == 0 {
-		return "", rest, nil
-	}
-
-	runes := []rune(string(line))
-	commentIdx := -1
-	for j := len(runes) - 1; j >= 0; j-- {
-		if runes[j] == '#' && j > 0 && isSpace(runes[j-1]) {
-			commentIdx = j
-			break
-		}
-	}
-	if commentIdx >= 0 {
-		line = []byte(string(runes[:commentIdx]))
-	}
-
-	trimmed := strings.TrimFunc(string(line), isSpace)
-
-	trimmed = resolveVars(trimmed, vars)
-
-	return trimmed, rest, nil
-}
-
-func extractSingleQuoted(src []byte) (value string, rest []byte, err error) {
-	for i := 1; i < len(src); i++ {
-		if src[i] == '\'' && src[i-1] != '\\' {
-			value = string(src[1:i])
-			rest = src[i+1:]
-			return
-		}
-		if src[i] == '\n' {
-			return "", nil, fmt.Errorf("unterminated quoted value %s", string(src))
-		}
-	}
-	return "", nil, fmt.Errorf("unterminated quoted value %s", string(src))
-}
-
-func extractDoubleQuoted(src []byte, vars map[string]string) (value string, rest []byte, err error) {
-	for i := 1; i < len(src); i++ {
-		if src[i] == '"' && src[i-1] != '\\' {
-			value = string(src[1:i])
-			value = processEscapes(value)
-			value = resolveVars(value, vars)
-			rest = src[i+1:]
-			return
-		}
-		if src[i] == '\n' {
-			return "", nil, fmt.Errorf("unterminated quoted value %s", string(src))
-		}
-	}
-	return "", nil, fmt.Errorf("unterminated quoted value %s", string(src))
-}
-
-func processEscapes(str string) string {
-	str = escapePattern.ReplaceAllStringFunc(str, func(match string) string {
-		if len(match) < 2 {
-			return match
-		}
-		switch match[1] {
-		case 'n':
-			return "\n"
-		case 'r':
-			return "\r"
-		default:
-			return match
-		}
-	})
-
-	str = unescapePattern.ReplaceAllString(str, "$1")
-	return str
-}
-
-func resolveVars(v string, m map[string]string) string {
-	return varPattern.ReplaceAllStringFunc(v, func(match string) string {
-		subs := varPattern.FindStringSubmatch(match)
-
-		if subs[1] == `\` || subs[3] == `(` {
-			return match[1:]
-		}
-
-		if subs[4] != "" {
-			if val, ok := m[subs[4]]; ok {
-				return val
+	for i := 0; i < len(line); {
+		r, size := utf8.DecodeRune(line[i:])
+		if r == '=' || r == ':' {
+			key = strings.TrimSpace(string(line[:i]))
+			if key == "" {
+				return "", nil, errors.New("empty variable name")
 			}
-			return ""
+
+			return key, bytes.TrimLeftFunc(line[i+size:], unicode.IsSpace), nil
 		}
 
-		return match
-	})
+		if !isKeyRune(r) {
+			return "", nil, fmt.Errorf("invalid character %q in variable name", r)
+		}
+
+		i += size
+	}
+
+	return "", nil, errors.New("missing '=' or ':' separator")
 }
 
-func hasQuotePrefix(src []byte) (prefix byte, isQuoted bool) {
-	if len(src) == 0 {
-		return 0, false
+// stripExport drops a leading "export" keyword.
+func stripExport(line []byte) []byte {
+	rest, ok := bytes.CutPrefix(line, []byte("export"))
+	if !ok || len(rest) == 0 {
+		return line
 	}
-	if src[0] == '\'' || src[0] == '"' {
-		return src[0], true
+
+	r, size := utf8.DecodeRune(rest)
+	if !unicode.IsSpace(r) {
+		return line
 	}
-	return 0, false
+
+	return bytes.TrimLeftFunc(rest[size:], unicode.IsSpace)
 }
 
-func isSpace(r rune) bool {
-	switch r {
-	case '\t', '\v', '\f', '\r', ' ', 0x85, 0xA0:
-		return true
-	}
-	return false
-}
-
-func isLineEnd(r rune) bool {
-	return r == '\n' || r == '\r'
+// isKeyRune reports whether r may appear inside a variable name.
+func isKeyRune(r rune) bool {
+	return r == '_' || r == '.' || unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.IsSpace(r)
 }

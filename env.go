@@ -1,6 +1,7 @@
 package env
 
 import (
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -11,7 +12,9 @@ import (
 var envprefix string
 
 func init() {
-	envfile.Load()
+	if err := envfile.Load(); err != nil {
+		log.Printf("[go-env] .env: %v", err)
+	}
 }
 
 // SetPrefix sets prefix for all env vars

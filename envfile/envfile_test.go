@@ -1,873 +1,295 @@
 package envfile
 
 import (
+	"maps"
 	"os"
+	"strings"
 	"testing"
 )
 
+func parse(t *testing.T, src string) (map[string]string, error) {
+	t.Helper()
+
+	out := map[string]string{}
+
+	return out, parseContent([]byte(src), out)
+}
+
+func TestParseStatements(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want map[string]string
+	}{
+		{"basic", "FOO=bar\nBAZ=qux\n", map[string]string{"FOO": "bar", "BAZ": "qux"}},
+		{"colon separator", "FOO: bar\nBAZ: qux\n", map[string]string{"FOO": "bar", "BAZ": "qux"}},
+		{"no trailing newline", "FOO=bar\nBAZ=qux", map[string]string{"FOO": "bar", "BAZ": "qux"}},
+		{"crlf", "FOO=bar\r\nBAZ=qux\r\n", map[string]string{"FOO": "bar", "BAZ": "qux"}},
+		{"lone cr", "FOO=bar\rBAZ=qux\r", map[string]string{"FOO": "bar", "BAZ": "qux"}},
+		{"nothing to parse", "\ufeff# one\n  # two\n\n   \t\n", map[string]string{}},
+		{"comment without newline", "# trailing comment", map[string]string{}},
+		{"multiple equals", "KEY=foo=bar\n", map[string]string{"KEY": "foo=bar"}},
+		{"empty values", "FOO=\nBAR=   \nBAZ=\"\"\nQUX=''\n", map[string]string{"FOO": "", "BAR": "", "BAZ": "", "QUX": ""}},
+		{"spaces around key", "  FOO = bar  \n", map[string]string{"FOO": "bar"}},
+		{"space inside key", "MY KEY=value\n", map[string]string{"MY KEY": "value"}},
+		{"tab inside key", "MY\tKEY=value\n", map[string]string{"MY\tKEY": "value"}},
+		{"dots and digits in key", "MY.KEY=1\nKEY123=2\n1KEY=3\n", map[string]string{"MY.KEY": "1", "KEY123": "2", "1KEY": "3"}},
+		{
+			"unicode key and value", "\u00dcSER=h\u00e9llo\n\u041f\u0410\u0420\u041e\u041b\u042c=\u0441\u0435\u043a\u0440\u0435\u0442\n",
+			map[string]string{"\u00dcSER": "h\u00e9llo", "\u041f\u0410\u0420\u041e\u041b\u042c": "\u0441\u0435\u043a\u0440\u0435\u0442"},
+		},
+		{"utf8 bom", "\ufeffFOO=bar\n", map[string]string{"FOO": "bar"}},
+		{
+			"export prefix", "export FOO=bar\nexport   BAZ=qux\nexport\tQUX=1\n",
+			map[string]string{"FOO": "bar", "BAZ": "qux", "QUX": "1"},
+		},
+		{"export as key", "export=value\n", map[string]string{"export": "value"}},
+		{"inline comment", "FOO=value # comment\n", map[string]string{"FOO": "value"}},
+		{"inline comment with tab", "FOO=value\t# comment\n", map[string]string{"FOO": "value"}},
+		{"hash without leading space is kept", "FOO=value#notacomment\n", map[string]string{"FOO": "value#notacomment"}},
+		{"hash at value start is kept", "FOO=#not-comment\n", map[string]string{"FOO": "#not-comment"}},
+		{"comment with hash inside", "FOO=hash # not # real\n", map[string]string{"FOO": "hash"}},
+		{"hex color is cut", "FOO=red #ff0000\n", map[string]string{"FOO": "red"}},
+		{"quoted value with trailing comment", "FOO=\"val\" # comment\n", map[string]string{"FOO": "val"}},
+		{"quotes inside unquoted value", "FOO=he said \"hi\"\n", map[string]string{"FOO": `he said "hi"`}},
+		{
+			"colons and exclamation in values", "DSN=postgres://user:pass@db:5432/mydb?sslmode=disable\nROOM=!random:example.com\n",
+			map[string]string{"DSN": "postgres://user:pass@db:5432/mydb?sslmode=disable", "ROOM": "!random:example.com"},
+		},
+		{
+			"realistic values", "ALLOWLIST=*@example.com *.test.com user@example.net\nENDPOINT=https://key@host.io/123\n" +
+				"DISPLAY=**{{ .name }} by {{ .email }}**\nTHROTTLE=5r/m\nIPS=10.0.0.1 192.168.1.0/24 ::1\n",
+			map[string]string{
+				"ALLOWLIST": "*@example.com *.test.com user@example.net", "ENDPOINT": "https://key@host.io/123",
+				"DISPLAY": "**{{ .name }} by {{ .email }}**", "THROTTLE": "5r/m", "IPS": "10.0.0.1 192.168.1.0/24 ::1",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, err := parse(t, tt.src)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !maps.Equal(out, tt.want) {
+				t.Errorf("got %v, want %v", out, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+		want    map[string]string
+	}{
+		{
+			"invalid key character", "A=1\nBAD%KEY=x\nB=2\n", "line 2: invalid character '%' in variable name",
+			map[string]string{"A": "1", "B": "2"},
+		},
+		{"hyphen in key", "MY-KEY=1\nB=2\n", "line 1: invalid character '-' in variable name", map[string]string{"B": "2"}},
+		{
+			"unterminated double quote", "A=1\nQ=\"oops\nB=2\n", "line 2: unterminated double-quoted value",
+			map[string]string{"A": "1", "B": "2"},
+		},
+		{"unterminated single quote", "Q='oops\nB=2\n", "line 1: unterminated single-quoted value", map[string]string{"B": "2"}},
+		{"multiline double quote", "Q=\"multi\nline\"\nB=2\n", "line 1: unterminated double-quoted value", map[string]string{"B": "2"}},
+		{
+			"missing separator mid file", "A=1\nPOSTGRES_PASSWORD\nB=2\n", "line 2: missing '=' or ':' separator",
+			map[string]string{"A": "1", "B": "2"},
+		},
+		{
+			"missing separator at eof", "A=1\nPOSTGRES_PASSWORD", "line 2: missing '=' or ':' separator",
+			map[string]string{"A": "1"},
+		},
+		{"export without separator", "export\nB=2\n", "line 1: missing '=' or ':' separator", map[string]string{"B": "2"}},
+		{"empty name", "=value\nB=2\n", "line 1: empty variable name", map[string]string{"B": "2"}},
+		{
+			"trailing content after quote", "A=\"x\" junk\nB=2\n", "line 1: unexpected 'j' after quoted value",
+			map[string]string{"B": "2"},
+		},
+		{
+			"escaped quote in single quotes", "A='it\\'s'\nB=2\n", "line 1: unexpected 's' after quoted value",
+			map[string]string{"B": "2"},
+		},
+		{"nul byte in value", "A=with\x00nul\nB=2\n", "line 1: value of A contains a NUL byte", map[string]string{"B": "2"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, err := parse(t, tt.src)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantErr)
+			}
+			if !maps.Equal(out, tt.want) {
+				t.Errorf("got %v, want %v", out, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseErrorsStayBounded(t *testing.T) {
+	src := "A=\"unterminated\nSECRET=super-secret-value\nBAZ=another-secret\n"
+	_, err := parse(t, src)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "super-secret-value") || strings.Contains(err.Error(), "another-secret") {
+		t.Errorf("error leaks neighboring values: %q", err)
+	}
+}
+
+func TestParseMultipleErrors(t *testing.T) {
+	out, err := parse(t, "BAD%KEY=x\nA=1\nMY-KEY=2\n")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range []string{"line 1: invalid character '%'", "line 3: invalid character '-'"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q", err, want)
+		}
+	}
+	if out["A"] != "1" {
+		t.Errorf("A = %q, want %q", out["A"], "1")
+	}
+}
+
+func TestLoadSkipsMissingFilesAndDirectories(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	if err := Load(); err != nil {
+		t.Errorf("missing .env must be silent, got %v", err)
+	}
+	if err := Load("absent.env"); err != nil {
+		t.Errorf("missing additional file must be silent, got %v", err)
+	}
+
+	if err := os.Mkdir("dir.env", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Load("dir.env"); err != nil {
+		t.Errorf("directory must be skipped, got %v", err)
+	}
+}
+
+func TestLoadSetsVars(t *testing.T) {
+	t.Chdir(t.TempDir())
+	writeEnvFile(t, DefaultFile, "FOO=bar\nBAZ=qux\n")
+	unsetEnv(t, "FOO", "BAZ")
+
+	if err := Load(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	checkEnv(t, "FOO", "bar")
+	checkEnv(t, "BAZ", "qux")
+}
+
+func TestLoadLaterFilesWin(t *testing.T) {
+	t.Chdir(t.TempDir())
+	writeEnvFile(t, DefaultFile, "FOO=first\n")
+	writeEnvFile(t, "a.env", "FOO=second\n")
+	writeEnvFile(t, "b.env", "FOO=third\n")
+	unsetEnv(t, "FOO")
+
+	if err := Load("a.env", "b.env"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	checkEnv(t, "FOO", "third")
+}
+
+func TestLoadOverridesProcessEnv(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("INHERITED", "from-process")
+	writeEnvFile(t, DefaultFile, "INHERITED=from-file\n")
+
+	if err := Load(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	checkEnv(t, "INHERITED", "from-file")
+}
+
+func TestLoadNeverReadsProcessEnv(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("REAL_SECRET", "s3cr3t")
+	writeEnvFile(t, DefaultFile, "DERIVED=$REAL_SECRET\n")
+	unsetEnv(t, "DERIVED")
+
+	if err := Load(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	checkEnv(t, "DERIVED", "$REAL_SECRET")
+}
+
+func TestLoadKeepsGoodLinesOnError(t *testing.T) {
+	t.Chdir(t.TempDir())
+	writeEnvFile(t, DefaultFile, "GOOD_ONE=1\nBAD%KEY=x\nGOOD_TWO=2\n")
+	unsetEnv(t, "GOOD_ONE", "GOOD_TWO")
+
+	err := Load()
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), ".env: line 2: invalid character '%'") {
+		t.Errorf("error = %q, want file name and line number", err)
+	}
+
+	checkEnv(t, "GOOD_ONE", "1")
+	checkEnv(t, "GOOD_TWO", "2")
+	if _, ok := os.LookupEnv("BAD%KEY"); ok {
+		t.Error("invalid key must not be set")
+	}
+}
+
+func TestLoadReportsEveryBrokenFile(t *testing.T) {
+	t.Chdir(t.TempDir())
+	writeEnvFile(t, DefaultFile, "A=1\nBAD%KEY=x\n")
+	writeEnvFile(t, "extra.env", "=value\n")
+	unsetEnv(t, "A")
+
+	err := Load("extra.env")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range []string{".env: line 2:", "extra.env: line 1:"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to mention %q", err, want)
+		}
+	}
+
+	checkEnv(t, "A", "1")
+}
+
+func writeEnvFile(t *testing.T, name, content string) {
+	t.Helper()
+
+	if err := os.WriteFile(name, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func unsetEnv(t *testing.T, keys ...string) {
+	t.Helper()
+
+	for _, key := range keys {
+		t.Cleanup(func() { os.Unsetenv(key) })
+		os.Unsetenv(key)
+	}
+}
+
 func checkEnv(t *testing.T, key, want string) {
 	t.Helper()
-	got := os.Getenv(key)
-	if got != want {
+
+	if got := os.Getenv(key); got != want {
 		t.Errorf("%s = %q, want %q", key, got, want)
-	}
-}
-
-func TestParseContent(t *testing.T) {
-	t.Run("empty file", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte{}, out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(out) != 0 {
-			t.Errorf("expected empty map, got %v", out)
-		}
-	})
-
-	t.Run("comments only", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("# this is a comment\n# another one\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(out) != 0 {
-			t.Errorf("expected empty map, got %v", out)
-		}
-	})
-
-	t.Run("whitespace only", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("   \n\t\n  \n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(out) != 0 {
-			t.Errorf("expected empty map, got %v", out)
-		}
-	})
-
-	t.Run("mixed comments and whitespace", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("\n  # comment\n  \n  # another\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(out) != 0 {
-			t.Errorf("expected empty map, got %v", out)
-		}
-	})
-
-	t.Run("basic key=value", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=bar\nBAZ=qux\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "bar" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "bar")
-		}
-		if out["BAZ"] != "qux" {
-			t.Errorf("BAZ = %q, want %q", out["BAZ"], "qux")
-		}
-	})
-
-	t.Run("key:value colon separator", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO:bar\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "bar" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "bar")
-		}
-	})
-
-	t.Run("no trailing newline", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=bar\nBAZ=qux"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "bar" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "bar")
-		}
-		if out["BAZ"] != "qux" {
-			t.Errorf("BAZ = %q, want %q", out["BAZ"], "qux")
-		}
-	})
-
-	t.Run("crlf normalization", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=bar\r\nBAZ=qux\r\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "bar" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "bar")
-		}
-		if out["BAZ"] != "qux" {
-			t.Errorf("BAZ = %q, want %q", out["BAZ"], "qux")
-		}
-	})
-
-	t.Run("multiple = signs", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("KEY=foo=bar\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["KEY"] != "foo=bar" {
-			t.Errorf("KEY = %q, want %q", out["KEY"], "foo=bar")
-		}
-	})
-
-	t.Run("whitespace-only value", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=\nBAR=   \n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "" {
-			t.Errorf("FOO = %q, want empty", out["FOO"])
-		}
-		if out["BAR"] != "" {
-			t.Errorf("BAR = %q, want empty", out["BAR"])
-		}
-	})
-
-	t.Run("space in key name", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("MY KEY=value\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["MY KEY"] != "value" {
-			t.Errorf("MY KEY = %q, want %q", out["MY KEY"], "value")
-		}
-	})
-
-	t.Run("key with dots", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("MY.KEY=value\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["MY.KEY"] != "value" {
-			t.Errorf("MY.KEY = %q, want %q", out["MY.KEY"], "value")
-		}
-	})
-
-	t.Run("key with numbers", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("KEY123=value\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["KEY123"] != "value" {
-			t.Errorf("KEY123 = %q, want %q", out["KEY123"], "value")
-		}
-	})
-
-	t.Run("inline comment", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=value # this is a comment\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "value" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "value")
-		}
-	})
-
-	t.Run("inline comment no space before hash", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=value#notacomment\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "value#notacomment" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "value#notacomment")
-		}
-	})
-
-	t.Run("inline comment with tab before hash", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=value\t# comment\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "value" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "value")
-		}
-	})
-
-	t.Run("export prefix", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("export FOO=bar\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "bar" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "bar")
-		}
-	})
-
-	t.Run("export as key", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("export=value\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["export"] != "value" {
-			t.Errorf("export = %q, want %q", out["export"], "value")
-		}
-	})
-
-	t.Run("export with extra spaces", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("export   FOO=bar\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "bar" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "bar")
-		}
-	})
-
-	t.Run("single-quoted value", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO='bar'\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "bar" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "bar")
-		}
-	})
-
-	t.Run("single-quoted with escaped quote", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO='bar\\'s'\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "bar\\'s" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "bar\\'s")
-		}
-	})
-
-	t.Run("single-quoted no expansion", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO='$HOME'\nBAR='$(cmd)'\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "$HOME" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "$HOME")
-		}
-		if out["BAR"] != "$(cmd)" {
-			t.Errorf("BAR = %q, want %q", out["BAR"], "$(cmd)")
-		}
-	})
-
-	t.Run("double-quoted value", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=\"bar\"\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "bar" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "bar")
-		}
-	})
-
-	t.Run("double-quoted escape sequences", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=\"\\\"bar\\\"\"\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != `"bar"` {
-			t.Errorf("FOO = %q, want %q", out["FOO"], `"bar"`)
-		}
-	})
-
-	t.Run("double-quoted newline escape", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=\"line1\\nline2\"\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "line1\nline2" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "line1\nline2")
-		}
-	})
-
-	t.Run("double-quoted carriage return escape", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=\"line1\\rline2\"\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "line1\rline2" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "line1\rline2")
-		}
-	})
-
-	t.Run("double-quoted backslash escape", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=\"a\\\\b\"\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "a\\b" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "a\\b")
-		}
-	})
-
-	t.Run("variable expansion $VAR", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("A=hello\nB=$A/world\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["A"] != "hello" {
-			t.Errorf("A = %q, want %q", out["A"], "hello")
-		}
-		if out["B"] != "hello/world" {
-			t.Errorf("B = %q, want %q", out["B"], "hello/world")
-		}
-	})
-
-	t.Run("variable expansion ${VAR}", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("A=hello\nB=${A}/world\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["B"] != "hello/world" {
-			t.Errorf("B = %q, want %q", out["B"], "hello/world")
-		}
-	})
-
-	t.Run("self-reference empty", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("A=$A\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["A"] != "" {
-			t.Errorf("A = %q, want empty", out["A"])
-		}
-	})
-
-	t.Run("later variable unavailable", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("A=$B\nB=hello\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["A"] != "" {
-			t.Errorf("A = %q, want empty", out["A"])
-		}
-		if out["B"] != "hello" {
-			t.Errorf("B = %q, want %q", out["B"], "hello")
-		}
-	})
-
-	t.Run("escaped dollar", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=\\$HOME\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "$HOME" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "$HOME")
-		}
-	})
-
-	t.Run("dollar paren literal", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=$(whoami)\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["FOO"] != "(whoami)" {
-			t.Errorf("FOO = %q, want %q", out["FOO"], "(whoami)")
-		}
-	})
-
-	t.Run("lowercase var no expansion", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("A=hello\nB=$a\n"), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out["B"] != "$a" {
-			t.Errorf("B = %q, want %q", out["B"], "$a")
-		}
-	})
-
-	t.Run("unterminated single quote error", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO='bar\n"), out)
-		if err == nil {
-			t.Fatal("expected error for unterminated quote")
-		}
-	})
-
-	t.Run("unterminated double quote error", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO=\"bar\n"), out)
-		if err == nil {
-			t.Fatal("expected error for unterminated quote")
-		}
-	})
-
-	t.Run("invalid key character", func(t *testing.T) {
-		out := map[string]string{}
-		err := parseContent([]byte("FOO%BAR=value\n"), out)
-		if err == nil {
-			t.Fatal("expected error for invalid key char")
-		}
-	})
-
-	t.Run("golden EXAMPLE_ENV content", func(t *testing.T) {
-		content := []byte("TEST_USER=admin\n" +
-			"TEST_SECRET=s3kr1t\n" +
-			"TEST_HOST=http://localhost:8080\n" +
-			"TEST_DSN=postgres://user:pass@db:5432/mydb?sslmode=disable\n" +
-			"TEST_DRIVER=postgres\n" +
-			"TEST_ALLOWLIST=*@example.com *.test.com user@example.net\n" +
-			"TEST_ENDPOINT=https://key@host.io/123\n" +
-			"TEST_EMPTY=\n" +
-			"TEST_EMPTY2=\n" +
-			"TEST_LEVEL=DEBUG\n" +
-			"TEST_LIMIT=5000\n" +
-			"TEST_IGNORE=\n" +
-			"TEST_TOKEN=abc123-def456-ghi789\n" +
-			"TEST_SENDER=bot@example.com\n" +
-			"TEST_REPLYTO=reply@example.net\n" +
-			"TEST_RECIPIENT=alert@example.org\n" +
-			"TEST_FLAG=1\n" +
-			"TEST_API_USER=apiuserhere\n" +
-			"TEST_API_SECRET=apisecrethere\n" +
-			"TEST_ALLOWED_IPS=10.0.0.1 192.168.1.0/24 ::1\n" +
-			"TEST_SVC_HOST=\n" +
-			"TEST_SVC_KEY=\n" +
-			"TEST_SVC_NAME=\n" +
-			"TEST_SVC_RETRIES=\n" +
-			"TEST_SVC_TIMEOUT=\n" +
-			"TEST_ROOM_ID=!random:example.com\n" +
-			"TEST_DISPLAY=\n" +
-			"TEST_REDIRECT=https://example.net\n" +
-			"TEST_REDIRECT_BACKUP=\n" +
-			"TEST_FEATURE_X=1\n" +
-			"TEST_FEATURE_Y=1\n" +
-			"TEST_THROTTLE=5r/m\n" +
-			"TEST_THROTTLE_SHARED=False\n" +
-			"TEST_EXTRA_FIELDS=name\n" +
-			"TEST_NOTIFY_SUBJECT=\n" +
-			"TEST_NOTIFY_BODY=\n" +
-			"TEST_ITEMS=main\n" +
-			"\n" +
-			"TEST_EMPTY=https://real.url\n" +
-			"TEST_EMPTY2=uuid-here\n" +
-			"TEST_SVC_HOST=https://svc.example.com\n" +
-			"TEST_SVC_KEY=real-api-key-here\n" +
-			"TEST_SVC_NAME=production\n" +
-			"TEST_SVC_RETRIES=3\n" +
-			"TEST_SVC_TIMEOUT=30\n" +
-			"TEST_REDIRECT_BACKUP=https://backup.example.de\n" +
-			"TEST_DISPLAY=**{{ .name }} by {{ .email }}**\n" +
-			"TEST_MASTER_SECRET=master-secret\n" +
-			"TEST_SLAVE_SECRET=slave-secret\n")
-
-		out := map[string]string{}
-		err := parseContent(content, out)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		tests := []struct {
-			key, want string
-		}{
-			{"TEST_USER", "admin"},
-			{"TEST_SECRET", "s3kr1t"},
-			{"TEST_HOST", "http://localhost:8080"},
-			{"TEST_DSN", "postgres://user:pass@db:5432/mydb?sslmode=disable"},
-			{"TEST_DRIVER", "postgres"},
-			{"TEST_ALLOWLIST", "*@example.com *.test.com user@example.net"},
-			{"TEST_ENDPOINT", "https://key@host.io/123"},
-			{"TEST_EMPTY", "https://real.url"},
-			{"TEST_EMPTY2", "uuid-here"},
-			{"TEST_LEVEL", "DEBUG"},
-			{"TEST_LIMIT", "5000"},
-			{"TEST_IGNORE", ""},
-			{"TEST_TOKEN", "abc123-def456-ghi789"},
-			{"TEST_SENDER", "bot@example.com"},
-			{"TEST_REPLYTO", "reply@example.net"},
-			{"TEST_RECIPIENT", "alert@example.org"},
-			{"TEST_FLAG", "1"},
-			{"TEST_API_USER", "apiuserhere"},
-			{"TEST_API_SECRET", "apisecrethere"},
-			{"TEST_ALLOWED_IPS", "10.0.0.1 192.168.1.0/24 ::1"},
-			{"TEST_SVC_HOST", "https://svc.example.com"},
-			{"TEST_SVC_KEY", "real-api-key-here"},
-			{"TEST_SVC_NAME", "production"},
-			{"TEST_SVC_RETRIES", "3"},
-			{"TEST_SVC_TIMEOUT", "30"},
-			{"TEST_ROOM_ID", "!random:example.com"},
-			{"TEST_DISPLAY", "**{{ .name }} by {{ .email }}**"},
-			{"TEST_REDIRECT", "https://example.net"},
-			{"TEST_REDIRECT_BACKUP", "https://backup.example.de"},
-			{"TEST_FEATURE_X", "1"},
-			{"TEST_FEATURE_Y", "1"},
-			{"TEST_THROTTLE", "5r/m"},
-			{"TEST_THROTTLE_SHARED", "False"},
-			{"TEST_EXTRA_FIELDS", "name"},
-			{"TEST_NOTIFY_SUBJECT", ""},
-			{"TEST_NOTIFY_BODY", ""},
-			{"TEST_ITEMS", "main"},
-			{"TEST_MASTER_SECRET", "master-secret"},
-			{"TEST_SLAVE_SECRET", "slave-secret"},
-		}
-		for _, tt := range tests {
-			if out[tt.key] != tt.want {
-				t.Errorf("%s = %q, want %q", tt.key, out[tt.key], tt.want)
-			}
-		}
-	})
-}
-
-func TestLoad(t *testing.T) {
-	t.Run("missing .env is silent", func(t *testing.T) {
-		dir := t.TempDir()
-		t.Chdir(dir)
-		Load()
-	})
-
-	t.Run("additional file missing is silent", func(t *testing.T) {
-		dir := t.TempDir()
-		t.Chdir(dir)
-		Load("nonexistent.env")
-	})
-
-	t.Run("loads .env and sets env vars", func(t *testing.T) {
-		dir := t.TempDir()
-		t.Chdir(dir)
-		os.WriteFile(".env", []byte("FOO=bar\nBAZ=qux\n"), 0o644)
-		os.Unsetenv("FOO")
-		os.Unsetenv("BAZ")
-		Load()
-		checkEnv(t, "FOO", "bar")
-		checkEnv(t, "BAZ", "qux")
-	})
-
-	t.Run("additional files override .env", func(t *testing.T) {
-		dir := t.TempDir()
-		t.Chdir(dir)
-		os.WriteFile(".env", []byte("FOO=bar\n"), 0o644)
-		os.WriteFile("override.env", []byte("FOO=override\nBAZ=qux\n"), 0o644)
-		os.Unsetenv("FOO")
-		os.Unsetenv("BAZ")
-		Load("override.env")
-		checkEnv(t, "FOO", "override")
-		checkEnv(t, "BAZ", "qux")
-	})
-
-	t.Run("later files overwrite earlier keys", func(t *testing.T) {
-		dir := t.TempDir()
-		t.Chdir(dir)
-		os.WriteFile(".env", []byte("FOO=first\n"), 0o644)
-		os.WriteFile("a.env", []byte("FOO=second\n"), 0o644)
-		os.WriteFile("b.env", []byte("FOO=third\n"), 0o644)
-		os.Unsetenv("FOO")
-		Load("a.env", "b.env")
-		checkEnv(t, "FOO", "third")
-	})
-}
-
-func TestSkipToStatement(t *testing.T) {
-	t.Run("nil on empty", func(t *testing.T) {
-		if got := skipToStatement([]byte{}); got != nil {
-			t.Errorf("expected nil, got %q", got)
-		}
-	})
-
-	t.Run("nil on whitespace", func(t *testing.T) {
-		if got := skipToStatement([]byte("   \n\t\n  ")); got != nil {
-			t.Errorf("expected nil, got %q", got)
-		}
-	})
-
-	t.Run("skips leading whitespace", func(t *testing.T) {
-		got := skipToStatement([]byte("  \n  FOO=bar"))
-		if string(got) != "FOO=bar" {
-			t.Errorf("expected %q, got %q", "FOO=bar", string(got))
-		}
-	})
-
-	t.Run("skips comment line", func(t *testing.T) {
-		got := skipToStatement([]byte("# comment\nFOO=bar"))
-		if string(got) != "FOO=bar" {
-			t.Errorf("expected %q, got %q", "FOO=bar", string(got))
-		}
-	})
-
-	t.Run("nil on eof inside comment", func(t *testing.T) {
-		got := skipToStatement([]byte("# comment with no newline"))
-		if got != nil {
-			t.Errorf("expected nil, got %q", got)
-		}
-	})
-}
-
-func TestExtractKey(t *testing.T) {
-	t.Run("basic key=value", func(t *testing.T) {
-		key, remaining, err := extractKey([]byte("FOO=bar"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if key != "FOO" {
-			t.Errorf("key = %q, want %q", key, "FOO")
-		}
-		if string(remaining) != "bar" {
-			t.Errorf("remaining = %q, want %q", string(remaining), "bar")
-		}
-	})
-
-	t.Run("space in key", func(t *testing.T) {
-		key, remaining, err := extractKey([]byte("MY KEY=value"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if key != "MY KEY" {
-			t.Errorf("key = %q, want %q", key, "MY KEY")
-		}
-		if string(remaining) != "value" {
-			t.Errorf("remaining = %q, want %q", string(remaining), "value")
-		}
-	})
-
-	t.Run("trailing space in key trimmed", func(t *testing.T) {
-		key, remaining, err := extractKey([]byte("MY KEY = value"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if key != "MY KEY" {
-			t.Errorf("key = %q, want %q", key, "MY KEY")
-		}
-		if string(remaining) != "value" {
-			t.Errorf("remaining = %q, want %q", string(remaining), "value")
-		}
-	})
-
-	t.Run("export stripped", func(t *testing.T) {
-		key, remaining, err := extractKey([]byte("export FOO=bar"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if key != "FOO" {
-			t.Errorf("key = %q, want %q", key, "FOO")
-		}
-		if string(remaining) != "bar" {
-			t.Errorf("remaining = %q, want %q", string(remaining), "bar")
-		}
-	})
-
-	t.Run("export without space is key", func(t *testing.T) {
-		key, remaining, err := extractKey([]byte("export=value"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if key != "export" {
-			t.Errorf("key = %q, want %q", key, "export")
-		}
-		if string(remaining) != "value" {
-			t.Errorf("remaining = %q, want %q", string(remaining), "value")
-		}
-	})
-
-	t.Run("error on invalid char", func(t *testing.T) {
-		_, _, err := extractKey([]byte("FOO%BAR=value"))
-		if err == nil {
-			t.Fatal("expected error")
-		}
-	})
-}
-
-func TestExtractValue(t *testing.T) {
-	t.Run("empty src", func(t *testing.T) {
-		val, rest, err := extractValue([]byte{}, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if val != "" {
-			t.Errorf("val = %q, want empty", val)
-		}
-		if rest != nil {
-			t.Errorf("rest = %q, want nil", rest)
-		}
-	})
-
-	t.Run("unquoted basic", func(t *testing.T) {
-		val, _, err := extractValue([]byte("value"), map[string]string{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if val != "value" {
-			t.Errorf("val = %q, want %q", val, "value")
-		}
-	})
-
-	t.Run("unquoted with inline comment", func(t *testing.T) {
-		val, _, err := extractValue([]byte("value # comment"), map[string]string{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if val != "value" {
-			t.Errorf("val = %q, want %q", val, "value")
-		}
-	})
-
-	t.Run("unquoted no space before hash keeps hash", func(t *testing.T) {
-		val, _, err := extractValue([]byte("value#notacomment"), map[string]string{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if val != "value#notacomment" {
-			t.Errorf("val = %q, want %q", val, "value#notacomment")
-		}
-	})
-
-	t.Run("unquoted trimmed", func(t *testing.T) {
-		val, _, err := extractValue([]byte("  value  "), map[string]string{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if val != "value" {
-			t.Errorf("val = %q, want %q", val, "value")
-		}
-	})
-
-	t.Run("single-quoted", func(t *testing.T) {
-		val, rest, err := extractValue([]byte("'value'\n"), map[string]string{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if val != "value" {
-			t.Errorf("val = %q, want %q", val, "value")
-		}
-		if string(rest) != "\n" {
-			t.Errorf("rest = %q, want %q", string(rest), "\n")
-		}
-	})
-
-	t.Run("double-quoted with expansion", func(t *testing.T) {
-		val, _, err := extractValue([]byte(`"$A/world"`), map[string]string{"A": "hello"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if val != "hello/world" {
-			t.Errorf("val = %q, want %q", val, "hello/world")
-		}
-	})
-
-	t.Run("double-quoted with escapes", func(t *testing.T) {
-		val, _, err := extractValue([]byte(`"\"quoted\""`), map[string]string{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if val != `"quoted"` {
-			t.Errorf("val = %q, want %q", val, `"quoted"`)
-		}
-	})
-}
-
-func TestProcessEscapes(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{`\"`, `"`},
-		{`\\`, `\`},
-		{`\$`, `\$`},
-		{`\n`, "\n"},
-		{`\r`, "\r"},
-		{`\x`, `x`},
-		{`"bar"`, `"bar"`},
-	}
-	for _, tt := range tests {
-		got := processEscapes(tt.input)
-		if got != tt.expected {
-			t.Errorf("processEscapes(%q) = %q, want %q", tt.input, got, tt.expected)
-		}
-	}
-}
-
-func TestResolveVars(t *testing.T) {
-	tests := []struct {
-		input    string
-		vars     map[string]string
-		expected string
-	}{
-		{"$FOO", map[string]string{"FOO": "bar"}, "bar"},
-		{"${FOO}", map[string]string{"FOO": "bar"}, "bar"},
-		{"$FOO/world", map[string]string{"FOO": "hello"}, "hello/world"},
-		{"$NOTHING", map[string]string{}, ""},
-		{"\\$FOO", map[string]string{"FOO": "bar"}, "$FOO"},
-		{"$(whoami)", map[string]string{}, "(whoami)"},
-		{"$foo", map[string]string{"foo": "bar"}, "$foo"},
-		{"hello", map[string]string{}, "hello"},
-	}
-	for _, tt := range tests {
-		got := resolveVars(tt.input, tt.vars)
-		if got != tt.expected {
-			t.Errorf("resolveVars(%q, %v) = %q, want %q", tt.input, tt.vars, got, tt.expected)
-		}
-	}
-}
-
-func TestIsSpace(t *testing.T) {
-	spaceRunes := []rune{'\t', '\v', '\f', '\r', ' ', 0x85, 0xA0}
-	for _, r := range spaceRunes {
-		if !isSpace(r) {
-			t.Errorf("isSpace(%q) should be true", r)
-		}
-	}
-	if isSpace('\n') {
-		t.Error("isSpace('\\n') should be false")
-	}
-	if isSpace('a') {
-		t.Error("isSpace('a') should be false")
-	}
-}
-
-func TestIsLineEnd(t *testing.T) {
-	if !isLineEnd('\n') {
-		t.Error("isLineEnd('\\n') should be true")
-	}
-	if !isLineEnd('\r') {
-		t.Error("isLineEnd('\\r') should be true")
-	}
-	if isLineEnd(' ') {
-		t.Error("isLineEnd(' ') should be false")
-	}
-}
-
-func TestHasQuotePrefix(t *testing.T) {
-	if prefix, ok := hasQuotePrefix([]byte("'value")); !ok || prefix != '\'' {
-		t.Errorf("expected single quote prefix")
-	}
-	if prefix, ok := hasQuotePrefix([]byte(`"value`)); !ok || prefix != '"' {
-		t.Errorf("expected double quote prefix")
-	}
-	if _, ok := hasQuotePrefix([]byte("value")); ok {
-		t.Errorf("expected no quote prefix")
-	}
-	if _, ok := hasQuotePrefix([]byte{}); ok {
-		t.Errorf("expected no quote prefix on empty")
 	}
 }
