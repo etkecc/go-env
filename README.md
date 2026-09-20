@@ -12,7 +12,7 @@ size := env.Int("cache.size", 1000) // export APP_CACHE_SIZE=500
 slice := env.Slice("form.fields") // export APP_FORM_FIELDS="one two three"
 
 // need to load custom env file?
-dotenv.Load(".env.dev", ".env.local")
+envfile.Load(".env.dev", ".env.local")
 ```
 
 see more in godoc
