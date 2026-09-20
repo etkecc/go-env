@@ -5,13 +5,13 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/etkecc/go-env/dotenv"
+	"github.com/etkecc/go-env/envfile"
 )
 
 var envprefix string
 
 func init() {
-	dotenv.Load()
+	envfile.Load()
 }
 
 // SetPrefix sets prefix for all env vars
